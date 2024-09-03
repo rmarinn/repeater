@@ -432,7 +432,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "relay"
+name = "repeater"
 version = "0.1.0"
 dependencies = [
  "anyhow",
