@@ -1,145 +1,129 @@
 use super::{Command, ConnectionHandler, ServerMessage};
-use futures::{stream::SplitSink, SinkExt, StreamExt};
+use anyhow::{anyhow, Result};
 use rand::Rng;
-use std::{collections::HashMap, iter, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, iter, sync::Arc};
 use tokio::{
     net::TcpStream,
-    sync::{broadcast, mpsc},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    },
+    WebSocketStream,
+};
+use tokio_util::sync::CancellationToken;
 
-/// Represents a connected client, managing their WebSocket sender and task handle.
-///
-/// The `Client` struct holds the WebSocket sender (`ws_tx`) that is used to send
-/// messages to the client, and a task handle (`task_handle`) that represents the
-/// asynchronous task managing the WebSocket connection.
-struct Client {
-    /// The WebSocket sender for sending messages to the client.
-    pub ws_tx: SplitSink<WebSocketStream<TcpStream>, Message>,
-
-    /// The handle for the asynchronous task managing the WebSocket connection.
-    pub task_handle: JoinHandle<()>,
-}
-
-impl Client {
-    /// Sends a message to the client via the WebSocket connection.
-    ///
-    /// # Parameters
-    /// - `msg`: The WebSocket `Message` to send.
-    ///
-    /// # Panics
-    /// This function will panic if sending the message fails.
-    pub async fn send(&mut self, msg: Message) {
-        self.ws_tx.send(msg).await.unwrap();
-    }
-}
-
-/// Manages active WebSocket connections and processes commands from clients.
+/// Manages active WebSocket connections and processes client commands.
 ///
 /// The `ConnectionManager` is responsible for registering new clients, relaying messages
 /// between clients, handling client disconnections, and shutting down all connections
 /// when required.
 pub struct ConnectionManager {
-    /// A map storing active clients by their unique identifier.
-    clients: HashMap<Arc<str>, Client>,
+    /// Stores active clients by their unique identifier.
+    clients: HashMap<Arc<str>, ConnectionHandler>,
 
-    /// The sender channel for dispatching commands to the connection manager.
+    /// Channel for dispatching commands to the connection manager.
     cmd_tx: mpsc::Sender<Command>,
 
-    /// The receiver channel for receiving commands.
+    /// Channel for receiving commands from clients.
     cmd_rx: mpsc::Receiver<Command>,
 
-    /// The receiver channel for receiving shutdown signals.
-    shutdown_rx: broadcast::Receiver<()>,
+    /// Token for managing graceful shutdowns.
+    cancellation_token: CancellationToken,
 }
 
 impl ConnectionManager {
     /// Spawns a new `ConnectionManager` and returns its command sender and task handle.
     ///
     /// # Parameters
-    /// - `shutdown_rx`: A broadcast receiver used to signal shutdown.
+    /// - `cancellation_token`: Token to signal the shutdown of the connection manager.
     ///
     /// # Returns
     /// A tuple containing the command sender and the handle to the connection manager task.
-    pub fn spawn(shutdown_rx: broadcast::Receiver<()>) -> (mpsc::Sender<Command>, JoinHandle<()>) {
+    pub fn spawn(cancellation_token: CancellationToken) -> (mpsc::Sender<Command>, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(100);
-        let mut mngr = Self {
+        let mut manager = Self {
             clients: HashMap::new(),
             cmd_tx: cmd_tx.clone(),
             cmd_rx,
-            shutdown_rx,
+            cancellation_token,
         };
-        let handle = tokio::spawn(async move { mngr.run().await });
+
+        // Spawn the task that runs the connection manager
+        let handle = tokio::spawn(async move { manager.run().await });
+
         (cmd_tx, handle)
     }
 
-    /// The main loop that runs the `ConnectionManager`, processing commands and handling shutdown.
+    /// The main loop of the `ConnectionManager`, processing commands and handling shutdown.
     ///
-    /// This loop listens for incoming commands or shutdown signals and responds appropriately.
+    /// This loop listens for incoming commands or cancellation signals and handles them accordingly.
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                Some(cmd) = self.cmd_rx.recv() => self.handle_command(cmd).await,
-                _ = self.shutdown_rx.recv() => {
-                    println!("");
-                    self.shutdown_clients().await;
+                Some(cmd) = self.cmd_rx.recv() => {
+                    if let Err(e) = self.handle_command(cmd).await {
+                        eprintln!("Error occured: {:?}", e);
+                        break;
+                    }
+                },
+                _ = self.cancellation_token.cancelled() => {
+                    println!("Shutting down server...");
+                    if let Err(e) = self.disconnect_clients().await {
+                        eprintln!("Error during client disconnection: {:?}", e)
+                    }
                     break;
                 }
             }
         }
     }
 
-    /// Handles individual commands received by the connection manager.
+    /// Processes individual commands received by the connection manager.
     ///
     /// # Parameters
-    /// - `cmd`: The command to process, which may involve relaying messages,
-    /// registering/unregistering clients, or sending error messages.
-    async fn handle_command(&mut self, cmd: Command) {
+    /// - `cmd`: A command to process, which can involve registering, unregistering, or relaying messages.
+    async fn handle_command(&mut self, cmd: Command) -> Result<()> {
         match cmd {
             Command::RelayMessage {
-                sender_id,
-                recvr_id,
+                client_id,
                 msg,
-            } => self.relay_msg(sender_id, recvr_id, msg).await,
+                result_tx,
+            } => self.relay_msg(client_id, msg, result_tx).await,
             Command::Register(ws_stream) => self.register_connection(ws_stream).await,
             Command::Unregister(client_id) => self.unregister_connection(client_id),
-            Command::ErrorMessage { client_id, msg } => self.send_err_msg(client_id, msg).await,
         }
     }
 
     /// Registers a new client and assigns them a unique identifier.
     ///
-    /// This function splits the WebSocket stream, generates a unique client ID,
-    /// and spawns a new task to handle the WebSocket connection for the client.
+    /// This function generates a unique client ID and spawns a new task to handle the WebSocket connection.
     ///
     /// # Parameters
-    /// - `ws_stream`: The WebSocket stream associated with the new client.
-    async fn register_connection(&mut self, ws_stream: WebSocketStream<TcpStream>) {
-        let (ws_tx, ws_rx) = ws_stream.split();
-
-        // find a free client_id
+    /// - `ws_stream`: The WebSocket stream of the new client.
+    async fn register_connection(&mut self, ws_stream: WebSocketStream<TcpStream>) -> Result<()> {
+        // Generate a unique client ID
         let mut client_id = Self::generate_rand_id();
         while self.clients.contains_key(&client_id) {
             client_id = Self::generate_rand_id();
         }
 
-        // start a process to handle the ws connection
-        let task_handle = ConnectionHandler::spawn(ws_rx, client_id.clone(), self.cmd_tx.clone());
+        // Spawn a task to handle the WebSocket connection
+        let mut conn = ConnectionHandler::spawn(ws_stream, self.cmd_tx.clone(), client_id.clone());
 
-        let mut client = Client { ws_tx, task_handle };
+        // Send the client ID to the client
+        conn.send_message(ServerMessage::client_id(
+            client_id.clone().to_string().into_boxed_str(),
+        ))
+        .await?;
 
-        // send the client id
-        client
-            .send(ServerMessage::client_id(
-                client_id.clone().to_string().into_boxed_str(),
-            ))
-            .await;
-
-        // store the client info
-        self.clients.insert(client_id.clone(), client);
+        // Store the connection handler's info
+        self.clients.insert(client_id.clone(), conn);
 
         println!("{} connected", client_id);
+        Ok(())
     }
 
     /// Relays a message from one client to another.
@@ -148,60 +132,56 @@ impl ConnectionManager {
     /// is sent back to the sender.
     ///
     /// # Parameters
-    /// - `sender_id`: The ID of the client sending the message.
-    /// - `recvr_id`: The ID of the client intended to receive the message.
-    /// - `msg`: The message content.
-    async fn relay_msg(&mut self, sender_id: Arc<str>, recvr_id: Box<str>, msg: Box<str>) {
-        if let Some(recvr) = self.clients.get_mut(&*recvr_id) {
-            // if there is a recipient, relay the message
-            recvr
-                .send(ServerMessage::relayed_msg(
-                    sender_id.to_string().into_boxed_str(),
-                    msg,
-                ))
-                .await;
-        } else if let Some(sender) = self.clients.get_mut(&sender_id) {
-            // if there is no recipient, send an error message
-            sender
-                .send(ServerMessage::error("Recipient not found"))
-                .await;
-        }
+    /// - `client_id`: The ID of the client receiving the message.
+    /// - `msg`: The message content to be relayed.
+    /// - `result_tx`: A channel to communicate the result of the relay operation.
+    async fn relay_msg(
+        &mut self,
+        client_id: Box<str>,
+        msg: Message,
+        result_tx: oneshot::Sender<Result<()>>,
+    ) -> Result<()> {
+        let result = match self.clients.get_mut(&*client_id) {
+            Some(client) => {
+                // if there is a recipient, relay the message
+                client.send_message(msg).await?;
+                Ok(())
+            }
+            None => Err(anyhow!("Failed to send message: recipient not found")),
+        };
+
+        result_tx
+            .send(result)
+            .map_err(|e| anyhow!("Error communicating with the connection handler: {:?}", e))?;
+
+        Ok(())
     }
 
     /// Unregisters a client and removes their connection.
     ///
     /// # Parameters
     /// - `client_id`: The ID of the client to be unregistered.
-    fn unregister_connection(&mut self, client_id: Arc<str>) {
+    fn unregister_connection(&mut self, client_id: Arc<str>) -> Result<()> {
         self.clients.remove(&client_id);
-        println!("{client_id} unregistered");
+        println!("{} unregistered", client_id);
+        Ok(())
     }
 
-    /// Sends an error message to a specific client.
+    /// Disconnects all active clients and shuts down their WebSocket connections.
     ///
-    /// # Parameters
-    /// - `client_id`: The ID of the client to receive the error message.
-    /// - `msg`: The error message content.
-    async fn send_err_msg(&mut self, client_id: Arc<str>, msg: Box<str>) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.send(ServerMessage::error(&msg)).await;
-        }
-    }
-
-    /// Shuts down all active client connections gracefully.
-    ///
-    /// This function sends a shutdown message to each client and then aborts
-    /// the tasks managing their WebSocket connections.
-    async fn shutdown_clients(&mut self) {
+    /// Sends a close frame to each client and removes them from the active client list.
+    async fn disconnect_clients(&mut self) -> Result<()> {
         for (client_id, mut client) in self.clients.drain() {
-            println!("Disconnecting client {}", client_id);
-            let _ = client
-                .send(Message::Text("Server is closing".to_string()))
-                .await;
-            let _ = client.send(Message::Close(None)).await;
-            client.task_handle.abort();
+            println!("Disconnecting {}", client_id);
+
+            let close_frame = CloseFrame {
+                code: CloseCode::Away,
+                reason: Cow::Owned("Server is closing".to_string()),
+            };
+            let _ = client.send_message(Message::Close(Some(close_frame))).await;
         }
         println!("All clients disconnected");
+        Ok(())
     }
 
     /// Generates a random client identifier.

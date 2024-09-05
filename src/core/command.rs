@@ -1,37 +1,35 @@
+use anyhow::Result;
 use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio_tungstenite::WebSocketStream;
+use tokio::{net::TcpStream, sync::oneshot};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
-/// Enum representing different commands that can be sent to the `ConnectionManager`.
+/// Represents commands sent to the `ConnectionManager` for managing WebSocket connections.
+///
+/// This enum defines various operations that the `ConnectionManager` can handle, such as
+/// registering new connections, unregistering clients, or relaying messages between clients.
 pub enum Command {
     /// Register a new WebSocket connection with the `ConnectionManager`.
     ///
-    /// # Arguments
-    /// * `WebSocketStream<TcpStream>` - The WebSocket stream associated with the connection.
+    /// # Parameters
+    /// - `WebSocketStream<TcpStream>`: The WebSocket stream associated with the new connection.
     Register(WebSocketStream<TcpStream>),
 
-    /// Unregister an existing client connection from the `ConnectionManager`.
+    /// Unregister a client connection from the `ConnectionManager`.
     ///
-    /// # Arguments
-    /// * `Arc<str>` - The unique identifier of the client to unregister.
+    /// # Parameters
+    /// - `Arc<str>`: The unique identifier of the client to be unregistered.
     Unregister(Arc<str>),
 
     /// Relay a message from one client to another.
     ///
-    /// # Arguments
-    /// * `sender_id: Arc<str>` - The unique identifier of the sending client.
-    /// * `recvr_id: Box<str>` - The unique identifier of the receiving client.
-    /// * `msg: Box<str>` - The message to be relayed.
+    /// # Parameters
+    /// - `client_id: Box<str>`: The unique identifier of the sending client.
+    /// - `msg: Message`: The message to be relayed to the receiving client.
+    /// - `result_tx: oneshot::Sender<Result<()>>`: A one-shot channel for signaling the result
+    ///   of the message relay, indicating success or error.
     RelayMessage {
-        sender_id: Arc<str>,
-        recvr_id: Box<str>,
-        msg: Box<str>,
+        client_id: Box<str>,
+        msg: Message,
+        result_tx: oneshot::Sender<Result<()>>,
     },
-
-    /// Send an error message to a specific client.
-    ///
-    /// # Arguments
-    /// * `client_id: Arc<str>` - The unique identifier of the client to receive the error message.
-    /// * `msg: Box<str>` - The error message content.
-    ErrorMessage { client_id: Arc<str>, msg: Box<str> },
 }

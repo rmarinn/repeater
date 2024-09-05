@@ -1,8 +1,15 @@
-use super::{ClientMessage, Command};
-use futures::{stream::SplitStream, StreamExt};
+use super::{serialization::ServerMessage, ClientMessage, Command};
+use anyhow::{anyhow, Result};
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use std::sync::Arc;
-use tokio::{net::TcpStream, sync::mpsc, task::JoinHandle};
-use tokio_tungstenite::WebSocketStream;
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 /// A WebSocket stream handler responsible for processing incoming messages.
 ///
@@ -13,74 +20,162 @@ use tokio_tungstenite::WebSocketStream;
 /// - `client_id`: An identifier for the client, shared across threads.
 /// - `cmd_tx`: A channel sender used to transmit validated commands to the `CommandManager`.
 pub struct ConnectionHandler {
-    client_id: Arc<str>,
-    cmd_tx: mpsc::Sender<Command>,
+    msg_tx: mpsc::Sender<Message>,
 }
+
+type WsReceiver = SplitStream<WebSocketStream<TcpStream>>;
+type WsSender = SplitSink<WebSocketStream<TcpStream>, Message>;
+type MngrCmdSender = mpsc::Sender<Command>;
+type ClientId = Arc<str>;
 
 impl ConnectionHandler {
     pub fn spawn(
-        mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
-        client_id: Arc<str>,
-        cmd_tx: mpsc::Sender<Command>,
-    ) -> JoinHandle<()> {
-        let handler = Self { client_id, cmd_tx };
-        tokio::spawn(async move {
-            while let Some(msg) = ws_rx.next().await {
-                match msg {
-                    Ok(msg) => {
-                        // deserialize then process message
-                        match ClientMessage::from(msg) {
-                            Ok(msg) => handler.process_msg(msg).await,
-                            Err(e) => {
-                                handler
-                                    .error(format!("Error deserializing client's message: {}", e))
-                                    .await
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("An error occurred while receiving ws message: {}", e);
-                        break;
-                    }
-                }
-            }
+        ws_stream: WebSocketStream<TcpStream>,
+        mngr_tx: MngrCmdSender,
+        client_id: ClientId,
+    ) -> Self {
+        let (ws_tx, ws_rx) = ws_stream.split();
+        let (msg_tx, msg_rx) = mpsc::channel(10);
+
+        // spawn a thread that will listen for incoming messages
+        tokio::spawn(Self::listen(ws_rx, mngr_tx, client_id, msg_tx.clone()));
+
+        // spawn a thread that will wait for outgoing messages
+        tokio::spawn(Self::wait_for_msgs(msg_rx, ws_tx));
+
+        Self { msg_tx }
+    }
+
+    pub async fn send_message(&mut self, msg: Message) -> Result<()> {
+        self.msg_tx.send(msg).await.map_err(|e| {
+            anyhow!(
+                "Error communicating with the connection handler thread: {:?}",
+                e
+            )
         })
     }
 
-    async fn process_msg(&self, msg: ClientMessage) {
+    // waits for incoming messages
+    async fn listen(
+        mut ws_rx: WsReceiver,
+        mngr_tx: MngrCmdSender,
+        client_id: ClientId,
+        msg_tx: mpsc::Sender<Message>,
+    ) {
+        while let Some(msg) = ws_rx.next().await {
+            let process_result = match msg {
+                Ok(msg) => Self::process_msg(msg, &mngr_tx, &msg_tx, &client_id).await,
+                Err(e) => {
+                    eprintln!("An error occurred while receiving ws message: {}", e);
+                    break;
+                }
+            };
+
+            if let Err(e) = process_result {
+                eprintln!("Error processing websocket message: {:?}", e);
+                break;
+            }
+        }
+
+        println!("closed ws listener");
+    }
+
+    /// waits for outgoing messages
+    async fn wait_for_msgs(mut msg_rx: mpsc::Receiver<Message>, mut ws_tx: WsSender) {
+        while let Some(msg) = msg_rx.recv().await {
+            if let Err(e) = ws_tx.send(msg.clone()).await {
+                eprintln!("Error sending websocket message: {:?}", e);
+            }
+        }
+    }
+
+    /// processes incoming messages
+    async fn process_msg(
+        msg: Message,
+        mngr_tx: &MngrCmdSender,
+        msg_tx: &mpsc::Sender<Message>,
+        client_id: &Arc<str>,
+    ) -> Result<()> {
+        // deserialize message
+        let msg = match ClientMessage::from(msg) {
+            Ok(msg) => msg,
+            Err(e) => {
+                let err_msg = format!("Error deserializing message from {}: {:?}", client_id, e);
+                eprintln!("{}", err_msg);
+                let msg = ServerMessage::error(&err_msg);
+                Self::send_ws_msg(msg_tx, msg).await?;
+                return Ok(());
+            }
+        };
+
         match msg {
-            ClientMessage::Message { recvr_id, msg } => self.relay_msg(recvr_id, msg).await,
-            ClientMessage::Disconnect => self.disconnect().await,
+            ClientMessage::Message { recipient_id, msg } => {
+                Self::relay_msg(recipient_id, msg, &client_id, &mngr_tx, &msg_tx).await?
+            }
+            ClientMessage::Disconnect => Self::disconnect(&mngr_tx, &client_id).await?,
             _ => (),
         };
+
+        Ok(())
     }
 
-    async fn relay_msg(&self, recvr_id: Box<str>, msg: Box<str>) {
-        self.cmd_tx
-            .send(Command::RelayMessage {
-                sender_id: self.client_id.clone(),
-                recvr_id: recvr_id.clone(),
-                msg,
-            })
-            .await
-            .unwrap();
+    /// ask manager to relay the sent message to the target client
+    async fn relay_msg(
+        recipient_id: Box<str>,
+        msg: Box<str>,
+        client_id: &Arc<str>,
+        mngr_tx: &MngrCmdSender,
+        msg_tx: &mpsc::Sender<Message>,
+    ) -> Result<()> {
+        let (result_tx, result_rx) = oneshot::channel();
+
+        let msg = ServerMessage::relayed_msg(client_id.to_string().into_boxed_str(), msg);
+        let cmd = Command::RelayMessage {
+            client_id: recipient_id.clone(),
+            msg,
+            result_tx,
+        };
+
+        Self::send_cmd_to_mngr(mngr_tx, cmd).await?;
+
+        match result_rx.await {
+            Ok(result) => {
+                if let Err(e) = result {
+                    // send an error message back to the sender
+                    let msg = ServerMessage::error(format!("{:?}", e).as_str().into());
+                    Self::send_ws_msg(msg_tx, msg).await?;
+                }
+            }
+            Err(e) => Err(anyhow!(
+                "Error receiving response from the manager: {:?}",
+                e
+            ))?,
+        }
+
+        Ok(())
     }
 
-    async fn disconnect(&self) {
-        println!("{} disconnected", self.client_id);
-        self.cmd_tx
-            .send(Command::Unregister(self.client_id.clone()))
-            .await
-            .unwrap();
+    /// unregisters the client on the connection manager
+    async fn disconnect(mngr_tx: &MngrCmdSender, client_id: &Arc<str>) -> Result<()> {
+        println!("{} disconnected", client_id);
+
+        let cmd = Command::Unregister(client_id.clone().into());
+        Self::send_cmd_to_mngr(mngr_tx, cmd).await?;
+
+        Ok(())
     }
 
-    async fn error(&self, msg: String) {
-        self.cmd_tx
-            .send(Command::ErrorMessage {
-                client_id: self.client_id.clone(),
-                msg: msg.into(),
-            })
+    async fn send_cmd_to_mngr(mngr_tx: &MngrCmdSender, cmd: Command) -> Result<()> {
+        mngr_tx
+            .send(cmd)
             .await
-            .unwrap();
+            .map_err(|e| anyhow!("Error communicating with the connection manager: {:?}", e))
+    }
+
+    async fn send_ws_msg(msg_tx: &mpsc::Sender<Message>, msg: Message) -> Result<()> {
+        msg_tx
+            .send(msg)
+            .await
+            .map_err(|e| anyhow!("Error communicating with the ws message sender: {:?}", e))
     }
 }
