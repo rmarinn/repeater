@@ -1,4 +1,4 @@
-use super::{Command, ServerMessage, WsStreamHandler};
+use super::{Command, ConnectionHandler, ServerMessage};
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use rand::Rng;
 use std::{collections::HashMap, iter, sync::Arc};
@@ -125,7 +125,7 @@ impl ConnectionManager {
         }
 
         // start a process to handle the ws connection
-        let task_handle = WsStreamHandler::spawn(ws_rx, client_id.clone(), self.cmd_tx.clone());
+        let task_handle = ConnectionHandler::spawn(ws_rx, client_id.clone(), self.cmd_tx.clone());
 
         let mut client = Client { ws_tx, task_handle };
 

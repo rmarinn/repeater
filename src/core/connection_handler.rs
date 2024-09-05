@@ -12,12 +12,12 @@ use tokio_tungstenite::WebSocketStream;
 /// # Fields
 /// - `client_id`: An identifier for the client, shared across threads.
 /// - `cmd_tx`: A channel sender used to transmit validated commands to the `CommandManager`.
-pub struct WsStreamHandler {
+pub struct ConnectionHandler {
     client_id: Arc<str>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
-impl WsStreamHandler {
+impl ConnectionHandler {
     pub fn spawn(
         mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
         client_id: Arc<str>,

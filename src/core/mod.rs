@@ -1,10 +1,11 @@
 mod command;
-mod conn_mngr;
+mod connection_handler;
+mod connection_manager;
 mod serialization;
-mod ws_stream_handler;
 
 use command::Command;
-use conn_mngr::ConnectionManager;
+use connection_handler::ConnectionHandler;
+use connection_manager::ConnectionManager;
 use serialization::{ClientMessage, ServerMessage};
 use std::net::SocketAddr;
 use tokio::{
@@ -12,7 +13,6 @@ use tokio::{
     sync::{broadcast, mpsc},
 };
 use tokio_tungstenite::accept_async;
-use ws_stream_handler::WsStreamHandler;
 
 /// Starts the WebSocket server at the specified address.
 ///
